@@ -1,0 +1,23 @@
+{
+  "name": "whatsapp-bot",
+  "module": "server.ts",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "@types/json2md": "^1.5.4",
+    "@types/qrcode": "^1.5.5",
+    "@types/qrcode-terminal": "^0.12.2",
+    "json2md": "^2.0.1",
+    "qrcode": "^1.5.3",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.25.0"
+  }
+}
