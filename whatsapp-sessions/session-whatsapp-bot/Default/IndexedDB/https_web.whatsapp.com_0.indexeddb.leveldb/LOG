@@ -1,0 +1,4 @@
+2025/06/20-12:45:21.397 5d68 Reusing MANIFEST C:\Users\ERESPA30\REpos\Whatsapp-Bot\whatsapp-sessions\session-whatsapp-bot\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2025/06/20-12:45:21.398 5d68 Recovering log #53
+2025/06/20-12:45:21.503 5d68 Reusing old log C:\Users\ERESPA30\REpos\Whatsapp-Bot\whatsapp-sessions\session-whatsapp-bot\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/000053.log 
+2025/06/20-12:45:23.592 6ec4 Manual compaction at level-0 from '\x00'\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00(\x00\x00\x00' @ 0 : 0; will stop at (end)

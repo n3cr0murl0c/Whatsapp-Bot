@@ -1,41 +1,206 @@
-import WAWebJS, { Client } from "whatsapp-web.js";
+import WAWebJS, { Client, LocalAuth } from "whatsapp-web.js";
 import json2md from "json2md";
-import QRCode from "qrcode";
-import qrcode from "qrcode-terminal";
-// const client = new Client({});
+import amqp from "amqplib";
+// RabbitMQ Configuration
 
-// client.on("qr", (qr) => {
-//   // Generate and scan this code with your phone
-//   console.log("QR RECEIVED", qr);
+const rabbitSettings = {
+  protocol: "amqp",
+  hostname: process.env.RABBITMQ_URL || "ectrmqasbs01", // Cambia por la IP o hostname de tu broker
+  port: 5672,
+  username: process.env.RABBITMQ_USER,
+  password: process.env.RABBITMQ_PASSWORD,
+  vhost: "/", // Opcional, por defecto es "/"
+  heartbeat: 60, // Intervalo de latido en segundos
+  locale: "es_EC", // Configuración regional
+};
 
-//   //   QRCode.toDataURL(qr, function (err, url) {
-//   //     console.log(url);
-//   //     console.log(err);
-//   //   });
-//   qrcode.generate(qr, { small: true });
-// });
+// RabbitMQ Configuration
+const QUEUE_NAME = process.env.QUEUE_NAME || "whatsapp_messages";
 
-// client.on("ready", () => {
-//   console.log("Client is ready!");
-// });
-
-// client.on("message", (msg) => {
-//   if (msg.body == "!ping") {
-//     msg.reply("pong");
-//   }
-// });
-
-// client.initialize();
-// const { Client, Location, Poll, List, Buttons, LocalAuth } = require('./index');
+// Message interface for RabbitMQ
+interface WhatsAppMessage {
+  to: string | string[]; // Single number or array of phone numbers
+  message: string;
+  type?: "text" | "media" | "base64";
+  mediaUrl?: string;
+  base64Data?: string; // Base64 encoded image data
+  mimetype?: string; // MIME type for base64 data (e.g., 'image/jpeg', 'image/png')
+  filename?: string; // Optional filename for the media
+  caption?: string;
+  options?: {
+    linkPreview?: boolean;
+    isViewOnce?: boolean;
+    sendAudioAsVoice?: boolean;
+  };
+}
 
 const client = new Client({
-  //   authStrategy: new LocalAuth(),
+  authStrategy: new LocalAuth({
+    clientId: "whatsapp-bot", // Unique identifier for this client
+    dataPath: "./whatsapp-sessions", // Directory to store session data
+  }),
   // proxyAuthentication: { username: 'username', password: 'password' },
   puppeteer: {
     // args: ['--proxy-server=proxy-server-that-requires-authentication.example.com'],
     headless: false,
   },
 });
+
+let rabbitConnection: amqp.ChannelModel | null = null;
+let rabbitChannel: amqp.Channel | null = null;
+
+// Initialize RabbitMQ connection
+async function initRabbitMQ() {
+  try {
+    console.log("Connecting to RabbitMQ...");
+    rabbitConnection = await amqp.connect(rabbitSettings);
+    rabbitChannel = await rabbitConnection.createChannel();
+
+    // Ensure queue exists
+    await rabbitChannel.assertQueue(QUEUE_NAME, { durable: true });
+
+    // Set prefetch to 1 to handle one message at a time
+    await rabbitChannel.prefetch(1);
+
+    console.log(`✅ Connected to RabbitMQ. Listening on queue: ${QUEUE_NAME}`);
+
+    // Start consuming messages
+    await consumeMessages();
+  } catch (error) {
+    console.error("❌ Failed to connect to RabbitMQ:", error);
+    // Retry connection after 5 seconds
+    setTimeout(initRabbitMQ, 5000);
+  }
+}
+
+// Consume messages from RabbitMQ queue
+async function consumeMessages() {
+  if (!rabbitChannel) {
+    console.error("RabbitMQ channel not available");
+    return;
+  }
+
+  await rabbitChannel.consume(QUEUE_NAME, async (msg) => {
+    if (!msg) return;
+
+    try {
+      const messageData: WhatsAppMessage = JSON.parse(msg.content.toString());
+      console.log("📨 Received message from queue:", messageData);
+
+      // Wait for WhatsApp client to be ready
+      if (!client.info) {
+        console.log("⏳ WhatsApp client not ready, queuing message...");
+        // Reject and requeue the message
+        rabbitChannel?.nack(msg, false, true);
+        return;
+      }
+
+      await sendWhatsAppMessage(messageData);
+
+      // Acknowledge the message
+      rabbitChannel?.ack(msg);
+      console.log("✅ Message sent and acknowledged");
+    } catch (error) {
+      console.error("❌ Error processing message:", error);
+      // Reject message without requeue (send to dead letter queue if configured)
+      rabbitChannel?.nack(msg, false, false);
+    }
+  });
+}
+
+// Send WhatsApp message based on queue data
+async function sendWhatsAppMessage(messageData: WhatsAppMessage) {
+  try {
+    // Handle multiple recipients
+    const recipients = Array.isArray(messageData.to)
+      ? messageData.to
+      : [messageData.to];
+    const results = [];
+
+    for (const recipient of recipients) {
+      try {
+        // Format phone number
+        let phoneNumber = recipient.includes("@c.us")
+          ? recipient
+          : `${recipient}@c.us`;
+
+        let result;
+        if (messageData.type === "base64" && messageData.base64Data) {
+          // Handle base64 image messages
+          const mediaData = {
+            mimetype: messageData.mimetype || "image/jpeg",
+            data: messageData.base64Data,
+            filename: messageData.filename || "image.jpg",
+          };
+
+          result = await client.sendMessage(phoneNumber, mediaData, {
+            caption: messageData.caption || messageData.message,
+            ...messageData.options,
+          });
+        } else if (messageData.type === "media" && messageData.mediaUrl) {
+          // Handle media URL messages
+          const response = await fetch(messageData.mediaUrl);
+          const buffer = await response.arrayBuffer();
+          const mediaData = {
+            mimetype:
+              response.headers.get("content-type") ||
+              "application/octet-stream",
+            data: Buffer.from(buffer).toString("base64"),
+            filename:
+              messageData.filename ||
+              messageData.mediaUrl.split("/").pop() ||
+              "media",
+          };
+
+          result = await client.sendMessage(phoneNumber, mediaData, {
+            caption: messageData.caption,
+            ...messageData.options,
+          });
+        } else {
+          // Handle text messages
+          result = await client.sendMessage(
+            phoneNumber,
+            messageData.message,
+            messageData.options
+          );
+        }
+
+        results.push({
+          recipient: phoneNumber,
+          success: true,
+          messageId: result.id._serialized,
+        });
+        console.log(`📤 Message sent to ${phoneNumber}`);
+      } catch (error) {
+        console.error(`❌ Error sending message to ${recipient}:`, error);
+        const errorMessage =
+          error instanceof Error ? error.message : String(error);
+        results.push({ recipient, success: false, error: errorMessage });
+      }
+    }
+
+    return results;
+  } catch (error) {
+    console.error("❌ Error processing WhatsApp message:", error);
+    throw error;
+  }
+}
+
+// Handle RabbitMQ connection errors
+function setupRabbitMQErrorHandlers() {
+  if (rabbitConnection) {
+    rabbitConnection.on("error", (err) => {
+      console.error("RabbitMQ connection error:", err);
+    });
+
+    rabbitConnection.on("close", () => {
+      console.log("RabbitMQ connection closed. Attempting to reconnect...");
+      rabbitConnection = null;
+      rabbitChannel = null;
+      setTimeout(initRabbitMQ, 5000);
+    });
+  }
+}
 
 // client initialize does not finish at ready now.
 client.initialize();
@@ -79,10 +244,21 @@ client.on("ready", async () => {
   client.pupPage?.on("error", function (err) {
     console.log("Page error: " + err.toString());
   });
+
+  // Initialize RabbitMQ after WhatsApp is ready
+  await initRabbitMQ();
+  setupRabbitMQErrorHandlers();
 });
 
 client.on("message", async (msg) => {
   console.log("MESSAGE RECEIVED", `from:${msg.from}, body:${msg.body}`);
+
+  // Check if msg.body exists and is a string before processing
+  if (!msg.body || typeof msg.body !== "string") {
+    console.log("Message body is empty or not a string, skipping...");
+    return;
+  }
+
   console.log("SPLIT:", msg.body.split(" "));
   if (msg.body.split(" ")[0] === "/jarvis") {
     if (!msg.hasMedia) {
@@ -92,7 +268,6 @@ client.on("message", async (msg) => {
           .split(" ")
           .shift()}. Siempre responde en español usando JSON, con la respuesta en la llave: respuesta`,
         format: "json",
-
         stream: false,
       });
       const res = await fetch("http://localhost:11434/api/generate", {
@@ -126,7 +301,12 @@ client.on("message_create", async (msg) => {
   }
 
   // Unpins a message
-  if (msg.fromMe && msg.body.startsWith("!unpin")) {
+  if (
+    msg.fromMe &&
+    msg.body &&
+    typeof msg.body === "string" &&
+    msg.body.startsWith("!unpin")
+  ) {
     const pinnedMsg = await msg.getQuotedMessage();
     if (pinnedMsg) {
       // Will unpin a message
@@ -173,28 +353,6 @@ client.on("message_ack", (msg, ack) => {
   }
 });
 
-// client.on("group_join", (notification) => {
-//   // User has joined or been added to the group.
-//   console.log("join", notification);
-//   notification.reply("User joined.");
-// });
-
-// client.on("group_leave", (notification) => {
-//   // User has left or been kicked from the group.
-//   console.log("leave", notification);
-//   notification.reply("User left.");
-// });
-
-// client.on("group_update", (notification) => {
-//   // Group picture, subject or description has been updated.
-//   console.log("update", notification);
-// });
-
-// client.on("change_state", (state) => {
-//   console.log("CHANGE STATE", state);
-// });
-
-// Change to false if you don't want to reject incoming calls
 let rejectCalls = true;
 
 client.on("call", async (call) => {
@@ -213,103 +371,39 @@ client.on("call", async (call) => {
     );
 });
 
-client.on("disconnected", (reason) => {
+client.on("disconnected", async (reason) => {
   console.log("Client was logged out", reason);
+  // Close RabbitMQ connection
+  if (rabbitConnection) {
+    await rabbitConnection.close();
+  }
 });
 
-// client.on("contact_changed", async (message, oldId, newId, isContact) => {
-//   /** The time the event occurred. */
-//   const eventTime = new Date(message.timestamp * 1000).toLocaleString();
+// Graceful shutdown
+process.on("SIGINT", async () => {
+  console.log("Shutting down gracefully...");
 
-//   console.log(
-//     `The contact ${oldId.slice(0, -5)}` +
-//       `${
-//         !isContact
-//           ? " that participates in group " +
-//             `${(await client.getChatById(message.to ?? message.from)).name} `
-//           : " "
-//       }` +
-//       `changed their phone number\nat ${eventTime}.\n` +
-//       `Their new phone number is ${newId.slice(0, -5)}.\n`
-//   );
+  if (rabbitChannel) {
+    await rabbitChannel.close();
+  }
 
-//   /**
-//    * Information about the @param {message}:
-//    *
-//    * 1. If a notification was emitted due to a group participant changing their phone number:
-//    * @param {message.author} is a participant's id before the change.
-//    * @param {message.recipients[0]} is a participant's id after the change (a new one).
-//    *
-//    * 1.1 If the contact who changed their number WAS in the current user's contact list at the time of the change:
-//    * @param {message.to} is a group chat id the event was emitted in.
-//    * @param {message.from} is a current user's id that got an notification message in the group.
-//    * Also the @param {message.fromMe} is TRUE.
-//    *
-//    * 1.2 Otherwise:
-//    * @param {message.from} is a group chat id the event was emitted in.
-//    * @param {message.to} is @type {undefined}.
-//    * Also @param {message.fromMe} is FALSE.
-//    *
-//    * 2. If a notification was emitted due to a contact changing their phone number:
-//    * @param {message.templateParams} is an array of two user's ids:
-//    * the old (before the change) and a new one, stored in alphabetical order.
-//    * @param {message.from} is a current user's id that has a chat with a user,
-//    * whos phone number was changed.
-//    * @param {message.to} is a user's id (after the change), the current user has a chat with.
-//    */
-// });
+  if (rabbitConnection) {
+    await rabbitConnection.close();
+  }
 
-// client.on('group_admin_changed', (notification) => {
-//     if (notification.type === 'promote') {
-//         /**
-//           * Emitted when a current user is promoted to an admin.
-//           * {@link notification.author} is a user who performs the action of promoting/demoting the current user.
-//           */
-//         console.log(`You were promoted by ${notification.author}`);
-//     } else if (notification.type === 'demote')
-//         /** Emitted when a current user is demoted to a regular user. */
-//         console.log(`You were demoted by ${notification.author}`);
-// });
-
-// client.on("group_membership_request", async (notification) => {
-//   /**
-//    * The example of the {@link notification} output:
-//    * {
-//    *     id: {
-//    *         fromMe: false,
-//    *         remote: 'groupId@g.us',
-//    *         id: '123123123132132132',
-//    *         participant: 'number@c.us',
-//    *         _serialized: 'false_groupId@g.us_123123123132132132_number@c.us'
-//    *     },
-//    *     body: '',
-//    *     type: 'created_membership_requests',
-//    *     timestamp: 1694456538,
-//    *     chatId: 'groupId@g.us',
-//    *     author: 'number@c.us',
-//    *     recipientIds: []
-//    * }
-//    *
-//    */
-//   // console.log(notification);
-//   // /** You can approve or reject the newly appeared membership request: */
-//   // await client.approveGroupMembershipRequestss(notification.chatId, notification.author);
-//   // await client.rejectGroupMembershipRequests(notification.chatId, notification.author);
-// });
-
-// client.on("message_reaction", async (reaction) => {
-//   console.log(
-//     "REACTION RECEIVED",
-//     new Date(reaction.timestamp * 1000).toLocaleDateString()
-//   );
-// });
-
-// client.on("vote_update", (vote) => {
-//   /** The vote that was affected: */
-//   console.log(vote);
-// });
+  await client.destroy();
+  process.exit(0);
+});
 
 async function runCommand(msg: WAWebJS.Message) {
+  // Check if msg.body exists and is a string before processing
+  if (!msg.body || typeof msg.body !== "string") {
+    console.log(
+      "Message body is empty or not a string, skipping command processing..."
+    );
+    return;
+  }
+
   if (msg.body === "!ping reply") {
     // Send a new message as a reply to the current one
     msg.reply("pong");
@@ -357,100 +451,6 @@ async function runCommand(msg: WAWebJS.Message) {
     } else {
       msg.reply("This command can only be used in a group!");
     }
-    // } else if (msg.body.startsWith('!join ')) {
-    //     const inviteCode = msg.body.split(' ')[1];
-    //     try {
-    //         await client.acceptInvite(inviteCode);
-    //         msg.reply('Joined the group!');
-    //     } catch (e) {
-    //         msg.reply('That invite code seems to be invalid.');
-    //     }
-    // } else if (msg.body.startsWith('!addmembers')) {
-    //     const group = await msg.getChat();
-    //     const result = await group.addParticipants(['number1@c.us', 'number2@c.us', 'number3@c.us']);
-    //     /**
-    //      * The example of the {@link result} output:
-    //      *
-    //      * {
-    //      *   'number1@c.us': {
-    //      *     code: 200,
-    //      *     message: 'The participant was added successfully',
-    //      *     isInviteV4Sent: false
-    //      *   },
-    //      *   'number2@c.us': {
-    //      *     code: 403,
-    //      *     message: 'The participant can be added by sending private invitation only',
-    //      *     isInviteV4Sent: true
-    //      *   },
-    //      *   'number3@c.us': {
-    //      *     code: 404,
-    //      *     message: 'The phone number is not registered on WhatsApp',
-    //      *     isInviteV4Sent: false
-    //      *   }
-    //      * }
-    //      *
-    //      * For more usage examples:
-    //      * @see https://github.com/pedroslopez/whatsapp-web.js/pull/2344#usage-example1
-    //      */
-    //     console.log(result);
-    // } else if (msg.body === '!creategroup') {
-    //     const partitipantsToAdd = ['number1@c.us', 'number2@c.us', 'number3@c.us'];
-    //     const result = await client.createGroup('Group Title', partitipantsToAdd);
-    //     /**
-    //      * The example of the {@link result} output:
-    //      * {
-    //      *   title: 'Group Title',
-    //      *   gid: {
-    //      *     server: 'g.us',
-    //      *     user: '1111111111',
-    //      *     _serialized: '1111111111@g.us'
-    //      *   },
-    //      *   participants: {
-    //      *     'botNumber@c.us': {
-    //      *       statusCode: 200,
-    //      *       message: 'The participant was added successfully',
-    //      *       isGroupCreator: true,
-    //      *       isInviteV4Sent: false
-    //      *     },
-    //      *     'number1@c.us': {
-    //      *       statusCode: 200,
-    //      *       message: 'The participant was added successfully',
-    //      *       isGroupCreator: false,
-    //      *       isInviteV4Sent: false
-    //      *     },
-    //      *     'number2@c.us': {
-    //      *       statusCode: 403,
-    //      *       message: 'The participant can be added by sending private invitation only',
-    //      *       isGroupCreator: false,
-    //      *       isInviteV4Sent: true
-    //      *     },
-    //      *     'number3@c.us': {
-    //      *       statusCode: 404,
-    //      *       message: 'The phone number is not registered on WhatsApp',
-    //      *       isGroupCreator: false,
-    //      *       isInviteV4Sent: false
-    //      *     }
-    //      *   }
-    //      * }
-    //      *
-    //      * For more usage examples:
-    //      * @see https://github.com/pedroslopez/whatsapp-web.js/pull/2344#usage-example2
-    //      */
-    //     console.log(result);
-    // } else if (msg.body === '!groupinfo') {
-    // let chat = await msg.getChat();
-    // if (chat.isGroup) {
-    //     msg.reply(`
-    //         *Group Details*
-    //         Name: ${chat.name}
-    //         Description: ${chat.description}
-    //         Created At: ${chat.createdAt.toString()}
-    //         Created By: ${chat.owner.user}
-    //         Participant count: ${chat.participants.length}
-    //     `);
-    // } else {
-    //     msg.reply('This command can only be used in a group!');
-    // }
   } else if (msg.body === "!chats") {
     const chats = await client.getChats();
     client.sendMessage(msg.from, `The bot has ${chats.length} chats open.`);
@@ -501,17 +501,6 @@ async function runCommand(msg: WAWebJS.Message) {
       const media = await quotedMsg.downloadMedia();
       await client.sendMessage(msg.from, media, { isViewOnce: true });
     }
-    // } else if (msg.body === '!location') {
-    //     // only latitude and longitude
-    //     await msg.reply(new Location(37.422, -122.084));
-    //     // location with name only
-    //     await msg.reply(new Location(37.422, -122.084, { name: 'Googleplex' }));
-    //     // location with address only
-    //     await msg.reply(new Location(37.422, -122.084, { address: '1600 Amphitheatre Pkwy, Mountain View, CA 94043, USA' }));
-    //     // location with name, address and url
-    //     await msg.reply(new Location(37.422, -122.084, { name: 'Googleplex', address: '1600 Amphitheatre Pkwy, Mountain View, CA 94043, USA', url: 'https://google.com' }));
-    // } else if (msg.location) {
-    //     msg.reply(msg.location);
   } else if (msg.body.startsWith("!status ")) {
     const newStatus = msg.body.split(" ")[1];
     await client.setStatus(newStatus);
@@ -554,45 +543,8 @@ async function runCommand(msg: WAWebJS.Message) {
       const quotedMsg = await msg.getQuotedMessage();
       client.interface.openChatWindowAt(quotedMsg.id._serialized);
     }
-    //   } else if (msg.body === "!buttons") {
-    //     let button = new Buttons(
-    //       "Button body",
-    //       [{ body: "bt1" }, { body: "bt2" }, { body: "bt3" }],
-    //       "title",
-    //       "footer"
-    //     );
-    //     client.sendMessage(msg.from, button);
-    //   } else if (msg.body === "!list") {
-    //     let sections = [
-    //       {
-    //         title: "sectionTitle",
-    //         rows: [
-    //           { title: "ListItem1", description: "desc" },
-    //           { title: "ListItem2" },
-    //         ],
-    //       },
-    //     ];
-    //     let list = new List("List body", "btnText", sections, "Title", "footer");
-    //     client.sendMessage(msg.from, list);
   } else if (msg.body === "!reaction") {
     msg.react("👍");
-    //   } else if (msg.body === "!sendpoll") {
-    //     /** By default the poll is created as a single choice poll: */
-    //     await msg.reply(new Poll("Winter or Summer?", ["Winter", "Summer"]));
-    //     /** If you want to provide a multiple choice poll, add allowMultipleAnswers as true: */
-    //     await msg.reply(new Poll("Cats or Dogs?", ["Cats", "Dogs"]));
-    //     /**
-    //      * You can provide a custom message secret, it can be used as a poll ID:
-    //      * @note It has to be a unique vector with a length of 32
-    //      */
-    //     await msg.reply(
-    //       new Poll("Cats or Dogs?", ["Cats", "Dogs"], {
-    //         messageSecret: [
-    //           1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    //           0, 0, 0, 0, 0, 0, 0, 0, 0,
-    //         ],
-    //       })
-    //     );
   } else if (msg.body === "!edit") {
     if (msg.hasQuotedMsg) {
       const quotedMsg = await msg.getQuotedMessage();
